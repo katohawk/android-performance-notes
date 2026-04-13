@@ -8,6 +8,8 @@ import kotlinx.coroutines.withTimeout
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
+// Two-phase construction: public DSL constructor builds Config, private constructor
+// consumes it. This keeps Config mutable during setup but the client immutable after.
 class ApiClient private constructor(
     private val baseUrl: String,
     private val auth: AuthManager,
@@ -53,6 +55,8 @@ class ApiClient private constructor(
         put("Content-Type", "application/json")
     }
 
+    // Retry wraps the entire request lifecycle. Timeout is per-attempt, not total —
+    // so 3 retries with 10s timeout can take up to 30s + backoff delays.
     internal suspend fun executeRequest(
         method: HttpMethod,
         path: String,
@@ -85,6 +89,8 @@ class ApiClient private constructor(
     }
 }
 
+// Abstraction boundary: SDK never depends on a specific HTTP library.
+// Ship OkHttpEngine / KtorEngine as separate optional artifacts in production.
 interface HttpEngine {
     suspend fun execute(
         url: String,

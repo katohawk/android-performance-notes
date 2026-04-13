@@ -1,8 +1,8 @@
 # android-performance-notes
 
-Production-level notes on Android performance and stability — from debugging ANRs in apps serving millions of users to reducing cold start time by hundreds of milliseconds.
+Production-level notes on Android performance and stability. Debugging ANRs in apps serving millions of users, reducing cold start by hundreds of milliseconds, and building developer-facing SDKs that don't make callers hate you.
 
-This is not a tutorial. It's a collection of patterns, checklists, and hard-won lessons from 10+ years of shipping and maintaining large-scale Android applications.
+Not a tutorial. Not a blog. This is the stuff that took hours to figure out and seconds to fix — extracted from 10+ years of working on large-scale Android applications so it's reusable next time.
 
 ## Focus Areas
 
@@ -12,12 +12,18 @@ This is not a tutorial. It's a collection of patterns, checklists, and hard-won 
 - **Memory & stability** — OOM patterns, leak detection, bitmap pooling, large heap trade-offs
 - **SDK design** — Kotlin-first API client with coroutines, DSL builders, and structured error handling
 
+## Who This Is For
+
+Senior Android engineers who already know the platform well but need a quick reference when they're knee-deep in a production issue. If you've ever stared at a `traces.txt` at 2am or tried to explain to product why cold start is 400ms slower on Samsung devices — this is for you.
+
+This is not beginner-friendly on purpose. It assumes you know what a binder transaction is, what R8 does, and why `SharedPreferences.apply()` isn't always async.
+
 ## Philosophy
 
 - Every note comes from a real production incident or optimization effort
 - No rewriting of official docs — only things that aren't obvious until you hit them
 - Emphasis on _what actually works_ over _what should work in theory_
-- Compact format: problem → causes → how to debug → what worked
+- Compact format: problem → symptoms → causes → how to debug → what worked
 
 ## Topics
 
@@ -57,13 +63,15 @@ result
 - Type-safe — no stringly-typed APIs, errors carry `ApiError` with code and context
 - Extensible — plug in any HTTP engine via `HttpEngine` interface
 
-See [`sdk/`](sdk/) for the full implementation.
+See [`sdk/`](sdk/) for implementation and [`sdk/DESIGN.md`](sdk/DESIGN.md) for design rationale.
 
-## Why This Repo Exists
+## Why This Matters
 
-Most Android performance knowledge lives in private postmortems, internal wikis, and Slack threads that disappear. This repo extracts the reusable parts — the debugging workflows, the non-obvious causes, the things that took hours to find and seconds to fix.
+There's a gap between "I read the Android docs" and "I've shipped fixes for this exact problem in production." The docs tell you what `StrictMode` does. They don't tell you that `SharedPreferences.apply()` silently blocks on `Activity.onStop()` through `QueuedWork.waitToFinish()`, or that 6 ContentProviders can add 300ms to cold start on a budget Snapdragon device before your `Application.onCreate()` even runs.
 
-It's meant to be useful to engineers who already know Android well but need a reference when they're deep in a production issue at 2am.
+The SDK sample exists for a similar reason. Lots of people can write Kotlin. Fewer people think about what happens when the caller's coroutine scope gets cancelled mid-request, or why `Result<T>` should carry a structured error instead of just a string.
+
+This repo is where that kind of production thinking gets written down.
 
 ## Structure
 
@@ -74,6 +82,7 @@ docs/
 └── crash-investigation.md
 
 sdk/
+├── DESIGN.md              ← design decisions and trade-offs
 ├── client/
 │   ├── ApiClient.kt
 │   ├── RequestBuilder.kt
@@ -87,6 +96,10 @@ sdk/
 └── example/
     └── Usage.kt
 ```
+
+## Contributing
+
+This is primarily a personal reference, but if you've hit something similar in production and have a correction or addition, issues and PRs are welcome.
 
 ## License
 

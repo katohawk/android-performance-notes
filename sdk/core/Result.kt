@@ -1,5 +1,7 @@
 package sdk.core
 
+// Custom Result instead of kotlin.Result: stdlib Result can't be used as a direct
+// return type in all contexts and only carries Throwable, not structured error info.
 sealed class Result<out T> {
 
     data class Success<T>(val data: T) : Result<T>()

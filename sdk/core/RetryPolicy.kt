@@ -28,6 +28,8 @@ class RetryPolicy(
         )
     }
 
+    // Caller gets the last failure if all attempts are exhausted.
+    // Non-retryable errors (4xx) short-circuit immediately.
     suspend fun <T> execute(block: suspend (attempt: Int) -> Result<T>): Result<T> {
         var currentDelay = initialDelay
         var lastResult: Result<T> = Result.Failure(ApiError.internal("No attempts made"))

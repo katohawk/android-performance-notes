@@ -43,6 +43,9 @@ class RequestBuilder(
         this.limitCount = count
     }
 
+    // Terminal operation. Everything before this is just building up query state.
+    // The suspend boundary is here, not on the builder methods — callers can
+    // construct queries on any thread without a coroutine scope.
     suspend fun execute(): Result<Response> {
         val path = buildPath()
         val headers = client.buildHeaders()
