@@ -1,202 +1,256 @@
 # Android Performance Optimization Notes (Production Cases)
 
-These notes summarize the kind of performance work I have done on production Android apps and SDKs from 2023 to 2025. The focus is practical: reducing ANRs, keeping startup predictable, avoiding OOMs, and removing waste from hot paths without turning the codebase into a science project.
+Production-focused notes from Android performance work on real apps and SDKs between 2023 and 2025. This is not a generic checklist. It is a compact record of the problems I have debugged, the changes I made, and the results those changes produced in startup, ANR, memory, networking, and SDK-heavy environments.
 
-The format is simple on purpose:
+## Impact
 
-- Problem
-- Root Cause
-- Solution
-- Result
+- Reduced cold start latency by restructuring initialization and moving non-critical SDK work off the main thread.
+- Lowered ANR risk by removing main-thread I/O, isolating timing work, and reducing startup queue pressure on the main `Looper`.
+- Improved memory stability by switching large-response handling from full buffering to streamed parsing.
+- Added memory guardrails that stop non-essential work before heap pressure turns into OOM.
+- Reduced APK size by removing unnecessary serialization dependencies and converting assets to lighter formats.
+- Improved network efficiency by warming connections early and skipping unneeded ad resources.
+- Built thread-pool isolation for config, ads, I/O, and scheduled work so unrelated tasks stop blocking each other.
+
+## Who This Is For
+
+- Android engineers working on production apps, not toy projects.
+- Engineers debugging ANRs, cold start regressions, crash spikes, or OOM issues.
+- Mobile engineers maintaining apps with heavy SDK integration.
+- Engineers building SDKs or shared mobile infrastructure used across multiple apps or teams.
+
+## Real Examples
+
+### Example 1: Startup ANR Caused by Storage and SDK Initialization
+
+**Problem**
+
+- Cold start was unstable.
+- Startup ANRs were tied to storage reads and third-party SDK init.
+
+**What caused it**
+
+- `SharedPreferences` and SDK initialization were both sitting on the critical startup path.
+- Several small startup tasks were competing on the main thread, which increased message queue pressure and delayed first-frame work.
+
+**What I changed**
+
+- Migrated hot config reads from `SharedPreferences` to MMKV.
+- Split cold-start reads into stages instead of loading everything up front.
+- Moved OAID/GID, analytics, browser components, and ad SDK startup off the main thread where integration rules allowed it.
+- Used `MessageQueue.IdleHandler` for work that could wait until the first burst of startup work finished.
+- Moved splash countdown handling to a `HandlerThread` so timing work stopped competing with rendering.
+
+**Result**
+
+- Configuration loading on the critical path improved by about 60x.
+- Startup became more predictable because blocking work and deferred work were separated clearly.
+- Main-thread stalls dropped because cold start no longer mixed storage, SDK init, and timing work in one lane.
+
+### Example 2: OOM Risk from Large Response Parsing
+
+**Problem**
+
+- Large responses created avoidable memory pressure and increased OOM risk on low-memory devices.
+
+**What caused it**
+
+- Response parsing used `bytes()`, which loaded the full payload into memory before parsing started.
+- Work kept running even when heap usage was already close to the limit.
+
+**What I changed**
+
+- Replaced `bytes()` with streamed parsing from `source()`.
+- Added an OOM circuit breaker to stop non-essential work when heap usage exceeded 85% or system free memory dropped below 50 MB.
+- Treated memory protection as part of task scheduling, not only as a parsing fix.
+
+**Result**
+
+- Peak allocation pressure dropped in large-response flows.
+- Memory handling became more defensive under stress instead of failing late.
+- The risky paths became more stable on low-end and low-memory devices.
 
 ## 1. Startup Optimization & ANR Reduction
 
 ### Problem
 
-- Cold start was unstable on low-end devices.
+- Cold start had too much work on the critical path.
 - ANRs were showing up during startup and app backgrounding.
-- Third-party SDK initialization was adding visible delay on the main thread.
-- Disk reads in the startup path were competing with first-frame work on the main `Looper`.
+- Third-party SDK integration added I/O and initialization cost at the worst possible time.
 
 ### Root Cause
 
-- `SharedPreferences` was part of the hot path during cold start and SDK init.
-- Some initialization work triggered synchronous I/O and XML parsing before the UI was ready.
-- OAID/GID, analytics, browser components, and ad SDK startup all competed for the main thread.
-- Main-thread message queue pressure was higher than expected because several tasks were small individually but expensive in aggregate.
-- Some countdown and splash-related work stayed on the UI thread longer than it needed to.
+- `SharedPreferences` reads were blocking the startup path.
+- OAID/GID, analytics, browser components, and ad startup all competed on the main thread.
+- Repeated framework queries and splash-related timing logic added avoidable work to the main `Looper`.
 
 ### Solution
 
-- Migrated storage access from `SharedPreferences` to MMKV for the hot configuration path.
-- Designed staged reads during cold start instead of loading everything up front.
-- Merged and simplified config tables so startup reads touched fewer sources.
-- Kept MMKV as the primary source and fell back to GreenDao only when needed.
-- Moved OAID/GID, analytics SDKs, and browser component initialization onto background threads.
-- Pulled ad SDK `init` and `start` work off the main thread where integration constraints allowed it.
-- Used `MessageQueue.IdleHandler` for non-critical startup tasks that could wait until the first burst of work was done.
-- Cached ad views ahead of display to reduce UI-thread work during splash and first-screen rendering.
-- Cached `DisplayMetrics` instead of repeatedly querying framework services.
-- Moved splash countdown handling to a dedicated `HandlerThread` to isolate timing work from UI rendering.
-- Let the host app handle main-process checks instead of repeating that work inside the SDK.
+- Replaced hot-path `SharedPreferences` access with MMKV to reduce storage overhead during startup.
+- Split startup config reads into phases so only required data loaded before first screen.
+- Merged config sources to reduce read amplification during cold start.
+- Moved OAID/GID, analytics, and browser initialization onto background threads.
+- Shifted ad SDK `init` and `start` work off the main thread where possible.
+- Deferred non-critical startup work with `MessageQueue.IdleHandler`.
+- Cached ad views before display to reduce UI-thread work during splash rendering.
+- Cached `DisplayMetrics` to avoid repeated framework lookups.
+- Moved splash countdown scheduling to a dedicated `HandlerThread`.
+- Let the host app perform main-process checks to avoid repeating that work inside the SDK.
 
 ### Result
 
-- Configuration loading improved by about 60x on the critical startup path.
-- Startup work became easier to reason about because tasks were split into blocking vs non-blocking phases.
-- Main-thread stalls during cold start were reduced by removing avoidable I/O, binder calls, and queue pressure.
-- ANR risk dropped because fewer startup tasks were fighting for the UI thread at once.
+- Reduced startup blocking by cutting I/O and SDK work from the first-frame path.
+- Lowered ANR risk by reducing contention on the main thread.
+- Made startup behavior easier to debug because initialization now had clear phases and ownership.
 
 ## 2. Memory Management & OOM Prevention
 
 ### Problem
 
-- Large responses and heavy pages caused unnecessary allocations.
-- OOM risk increased under memory pressure, especially on low-RAM devices.
-- Some crash paths were tied to WebView and Binder transaction limits.
-- Destroyed screens sometimes held onto view references longer than expected.
+- Large payloads created temporary objects that pushed the app toward OOM.
+- Some crash paths were tied to memory pressure and oversized Binder transactions.
+- Destroyed screens could retain more view state than they should.
 
 ### Root Cause
 
-- `Retrofit` response handling used `bytes()`, which materialized the full payload in memory before parsing.
-- Work continued even when heap usage was already too high.
-- Binder transactions could fail when large state moved across process boundaries.
-- View hierarchies were not always detached cleanly after `Activity` or `Fragment` teardown, which increased leak risk.
-- GC pressure was coming from large temporary objects rather than steady-state usage alone.
+- `Retrofit` parsing used `bytes()`, which forced full in-memory buffering.
+- Background work kept running even when the process was already under memory pressure.
+- WebView-related flows could hit `TransactionTooLargeException`.
+- View hierarchies were not always cleared aggressively enough on teardown.
 
 ### Solution
 
-- Replaced `bytes()` with streamed parsing from `source()` to avoid large one-shot allocations.
-- Added an OOM circuit breaker:
-  - Stop non-essential tasks when app heap usage exceeds 85%.
-  - Stop non-essential tasks when system free memory drops below 50 MB.
-- Treated memory protection as a scheduling problem, not just a parsing problem.
-- Added a defensive workaround for WebView-related `TransactionTooLargeException` by bypassing the Binder-heavy path with a static holder strategy.
-- Recursively cleared the view tree up to three levels deep during `Activity` and `Fragment` destruction to reduce retained references in known leak-prone flows.
+- Switched from `bytes()` to `source()` so parsing could stream instead of buffering the whole response.
+- Added an OOM circuit breaker that stops non-essential tasks above 85% heap usage or below 50 MB of free system memory.
+- Used a static-holder workaround in the WebView path to avoid Binder-heavy state transfer.
+- Recursively removed view references up to three levels deep during `Activity` and `Fragment` destruction.
 
 ### Result
 
-- Large payload handling became more stable because parsing no longer depended on one big byte array.
-- Peak allocation pressure dropped in response-heavy paths.
-- Memory pressure handling became proactive instead of waiting for the process to crash.
-- OOM and large-transaction risk was reduced in the flows that previously failed under stress.
+- Reduced large-object allocation in response parsing.
+- Lowered the chance that memory spikes would turn into process death.
+- Improved stability in heavy-page and WebView-related flows.
+- Reduced leak-prone retained references during lifecycle teardown.
 
 ## 3. APK Size & Network Optimization
 
 ### Problem
 
-- Package size was higher than it needed to be.
-- Startup and ad loading were paying for assets and network work that were not always needed.
-- Connection setup added avoidable latency before the real request started.
+- The app carried dependency and asset weight it did not need.
+- Network flows downloaded resources that were not always used.
+- Connection setup cost showed up too late in user-critical flows.
 
 ### Root Cause
 
-- The serialization stack pulled in more transitive code than the app needed.
-- PNG assets were larger than necessary for production delivery.
-- Some resource downloads were unconditional, even when the UI path would never display them.
-- Network requests paid the cost of DNS, TCP, and TLS setup too late in the flow.
+- Serialization dependencies pulled in extra code and transitive weight.
+- PNG assets were heavier than necessary.
+- Resource download logic was not strict enough for media-specific ad flows.
+- DNS, TCP, and TLS setup happened only when the real request started.
 
 ### Solution
 
-- Replaced Avro usage with Gson in the relevant path and removed Jackson from the dependency graph.
-- Converted suitable PNG resources to WebP.
-- Added preconnect using an HTTP `HEAD` request to establish the connection before the real payload request.
-- Tightened download logic for video ads so image resources were skipped when the flow only needed video content.
+- Replaced the Avro-based path with Gson where the simpler stack was sufficient.
+- Removed Jackson from the dependency graph to cut package size.
+- Converted suitable PNG assets to WebP.
+- Added preconnect with HTTP `HEAD` to establish connections earlier.
+- Skipped image downloads for video ads when the flow only required video resources.
 
 ### Result
 
-- APK size dropped by 25% after removing Jackson-related overhead.
-- Asset delivery became leaner with smaller image resources.
-- Network warm-up reduced avoidable connection setup latency on critical paths.
-- Resource fetching became more precise, which lowered wasted bandwidth and background work.
+- Reduced APK size by 25% after removing Jackson-related overhead.
+- Reduced unnecessary bandwidth use by tightening resource download rules.
+- Improved request readiness by warming network connections before the critical request.
 
 ## 4. Concurrency & Threading Model
 
 ### Problem
 
-- A single shared thread pool created interference between unrelated work.
-- Handler-heavy scheduling added overhead and made execution order harder to reason about.
-- Time-sensitive tasks and blocking I/O could delay each other.
+- One shared executor made unrelated tasks block each other.
+- Handler-heavy scheduling made task flow harder to reason about.
+- Time-sensitive work and blocking I/O were mixed together.
 
 ### Root Cause
 
-- Config loading, ad tasks, file I/O, and scheduled jobs all shared the same executor.
-- Queue contention made latency unpredictable even when individual tasks were small.
-- Some work still used `Handler`-based dispatch where a regular executor was simpler and cheaper.
-- Message creation overhead was small but repeated often enough to matter in hot paths.
+- Config, ads, I/O, and scheduled jobs all shared the same thread-pool lane.
+- Queue contention increased latency even when individual tasks were small.
+- Some non-UI work still depended on `Handler` dispatch instead of simpler executor-based scheduling.
 
 ### Solution
 
-- Split one general-purpose thread pool into isolated executors by workload:
-  - configuration
-  - ads
-  - I/O
-  - scheduled tasks
-- Simplified scheduling logic to remove extra `execute()` indirection where it was not buying anything.
-- Replaced selected `Handler` usage with thread-pool execution for non-UI work.
-- Reused message objects with `Message.obtain()` in hot message paths.
-- Treated isolation as a stability feature, not only a throughput feature.
+- Split the single thread pool into isolated executors for config, ads, I/O, and scheduled work.
+- Removed extra scheduling indirection where `execute()` calls were stacked without real value.
+- Replaced selected `Handler` usage with thread-pool execution for non-UI tasks.
+- Reused message instances with `Message.obtain()` in hot paths.
 
 ### Result
 
-- Cross-task interference dropped because high-latency I/O no longer blocked unrelated work.
-- Scheduling behavior became easier to predict and debug.
-- Background execution was better aligned with Android’s threading model: UI work stayed on the main `Looper`, blocking work moved out, and timed work ran in dedicated lanes.
+- Reduced cross-task interference between I/O, config, and ad work.
+- Made execution order more predictable and easier to debug.
+- Kept UI work on the main `Looper` and moved blocking work into dedicated background lanes.
 
 ## 5. Data Structure & Performance Optimization
 
 ### Problem
 
-- Several hot paths were paying unnecessary CPU and allocation costs.
-- Reflection, regex, and small-object churn were adding up in tight loops.
-- Database and cache behavior was not tuned for repeated access patterns.
+- Several hot paths were doing more CPU and allocation work than necessary.
+- Reflection and regex added overhead in repeated operations.
+- Database and cache behavior did not match real production access patterns.
 
 ### Root Cause
 
-- Generic JSON serialization relied on reflection where the schema was already stable.
-- Regex was used for simple character checks that did not need it.
-- Database writes were too granular.
-- Cache strategy was not layered enough for real production access patterns.
+- Gson-based parsing depended on reflection in stable, high-frequency paths.
+- Regex was used for checks that only needed simple ASCII validation.
+- Database writes were too fragmented.
+- Cache policy was not layered enough for local and server-side behavior.
 
 ### Solution
 
-- Replaced Gson-based parsing with hand-written JSON parsing in the hottest paths where the payload format was controlled and stable.
-- Switched simple regex checks to ASCII-based character validation.
-- Used GreenDao batch operations instead of many small writes.
-- Built a multi-level cache strategy with:
-  - local memory cache
-  - LRU eviction
-  - server-side policy coordination
-- Only applied low-level optimizations in paths that had real call frequency or trace evidence behind them.
+- Replaced Gson with hand-written JSON parsing in the hottest controlled-schema paths.
+- Replaced simple regex checks with ASCII-based validation.
+- Switched GreenDao operations to batch writes where possible.
+- Built a multi-level cache with local memory, LRU eviction, and server-side policy coordination.
 
 ### Result
 
-- Hot-path CPU work became more predictable.
-- Allocation overhead dropped in parsing and validation code.
-- Database access became cheaper under bursty workloads.
-- Cache hit behavior improved because local and server-side strategy were aligned.
+- Reduced CPU overhead in parsing and validation hot paths.
+- Reduced allocation churn caused by reflection-heavy parsing.
+- Improved database efficiency under bursty write patterns.
+- Improved cache hit behavior by aligning local and server-side strategy.
+
+## SDK Design Notes
+
+This work also reflects production SDK design, not only app-side optimization.
+
+- Built around a coroutine-first model so network and storage work stay off the main thread by default.
+- Used structured error handling so callers receive typed failures instead of vague strings.
+- Kept the architecture extensible so transport, auth, and retry behavior can evolve without rewriting the API surface.
+- Designed integrations for production usage, where cancellation, host-app constraints, and backward compatibility matter as much as clean syntax.
+- Reduced host-app overhead by avoiding repeated process checks and unnecessary framework lookups inside SDK code.
+- Treated startup cost as an SDK design problem, not only an app integration problem.
 
 ## Key Takeaways
 
-- I treat performance work as systems work. Startup, memory, Binder, GC, storage, and scheduling all interact.
-- I avoid blanket fixes. The first step is always to identify the blocking path, allocation source, or queue bottleneck.
-- I prefer changes that reduce contention on the main `Looper` and lower peak memory pressure at the same time.
-- Trade-offs matter. Some fixes improve latency but increase complexity, so I keep hot-path code explicit and narrow.
-- The best performance work is measurable, reversible, and easy for the next engineer to maintain.
+- Remove work from the main thread first, then decide what truly belongs in startup.
+- Prefer streaming over full buffering when payload size is unpredictable.
+- Design for low-end devices and memory pressure, not only for modern flagship phones.
+- Isolate unrelated workloads so one slow lane does not stall the rest of the app.
+- Keep performance fixes measurable, narrow, and maintainable.
 
 ## Topics Covered
 
-- ANR reduction
 - Startup optimization
-- Main-thread scheduling
-- Looper and message queue behavior
+- ANR reduction
+- Main-thread debugging
+- `Looper` and message queue behavior
 - Memory management
 - OOM prevention
-- GC pressure reduction
 - Binder transaction limits
 - WebView stability
 - APK size reduction
-- Network warm-up and download control
-- Thread pool design
-- Data structure and cache optimization
+- Network warm-up
+- Resource download control
+- Thread-pool design
+- Data structure optimization
+- Cache strategy
+- SDK design
 - Crash debugging
